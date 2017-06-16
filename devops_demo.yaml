@@ -1,0 +1,461 @@
+---
+heat_template_version: 2015-04-30
+
+description: "DevOps Demo Stack"
+
+parameters:
+  key_name:
+    type: string
+    description: Name of keypair to assign to servers
+    constraints:
+      - { custom_constraint: nova.keypair }
+  pe_source_url:
+    type: string
+    description: URL to download Puppet Enterprise from (tar.gz or tar)
+    default: http://pe-releases.puppetlabs.net/2016.4.0/puppet-enterprise-2016.4.0-el-7-x86_64.tar.gz
+  private_net:
+    type: string
+    description: The name of the private network you wish to attach this stack too
+    default: network0
+  public_net:
+    type: string
+    description: The name of the network to source public floaiting IPs from
+    default: ext-net-pdx1-opdx1
+
+resources:
+
+  master_server:
+    type: OS::Nova::Server
+    properties:
+      name: "master.inf.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "m1.medium"
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: master_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+            set -ex
+            hostname $(curl http://169.254.169.254/latest/meta-data/local-hostname)
+            echo $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4) $(hostname) >> /etc/hosts
+            echo $gitlab_floating_ip gitlab.inf.puppet.vm >> /etc/hosts
+            mkdir -p /etc/puppetlabs/puppet
+            echo '*' > /etc/puppetlabs/puppet/autosign.conf
+            retrycurl() { set +e; while :; do curl "$@"; [ "$?" = 0 ] && break; done; set -e; }
+            retrycurl --max-time 30 -o pe.archive $pe_source_url
+            tar -xf pe.archive
+            cat > pe.conf <<-EOF
+            {
+              "console_admin_password": "puppetlabs"
+              "puppet_enterprise::puppet_master_host": "%{::trusted.certname}"
+              "puppet_enterprise::use_application_services": true
+              "puppet_enterprise::profile::master::r10k_remote": "$control_repository"
+              "puppet_enterprise::profile::master::r10k_private_key": "$control_private_key"
+              "puppet_enterprise::profile::master::code_manager_auto_configure": true
+              "puppet_enterprise::profile::master::check_for_updates": false
+            }
+            EOF
+            ./puppet-enterprise-*-el-7-x86_64/puppet-enterprise-installer -c pe.conf
+
+            #Install puppetclassify gem so node groups can be managed by Puppet code
+            #Needs to be done prior to puppet run
+            ( /opt/puppetlabs/puppet/bin/gem list | grep puppetclassify || /opt/puppetlabs/puppet/bin/gem install puppetclassify )
+
+            #Create non-admin user (Casey)
+            #Needed because admin user cannot issue code deployments through code manager
+            curl -H "Content-Type: application/json" -X POST -d '{"login":"casey", "email":"casey@puppet.com", "display_name":"Casey London", "role_ids":[1], "password":"puppetlabs" }' \
+              --cert `puppet config print hostcert` \
+              --key `puppet config print hostprivkey` \
+              --cacert `puppet config print cacert` \
+              https://master.inf.puppet.vm:4433/rbac-api/v1/users
+
+            #Get access token needed for code deploy (Code manager API does not support white listed certificates for auth)
+            mkdir -p /root/.puppetlabs
+            curl --cacert `puppet config print cacert` -X POST -H 'Content-Type: application/json' \
+              -d '{"login": "casey", "password": "puppetlabs", "lifetime": "4d", "label": "four-day token"}' \
+              https://master.inf.puppet.vm:4433/rbac-api/v1/auth/token | python -c 'import sys, json; print json.load(sys.stdin)["token"]' > /root/.puppetlabs/token
+
+            #Set up the license key so we can pull PE only modules in code deploy
+            cat > /etc/puppetlabs/license.key <<-EOF
+            #######################
+            #  Begin License File #
+            #######################
+
+            # PUPPET ENTERPRISE LICENSE - Puppet Enterprise Demo
+
+            uuid: 1e19d88fe3350d52f6de9053cd0b19e898b91caf
+
+            to: "Puppet"
+
+            nodes: 30000
+
+            end: 2020-12-31
+
+            #####################
+            #  End License File #
+            #####################
+            EOF
+
+            #Load the license file into puppetserver with a service restart
+            /sbin/service pe-puppetserver restart
+
+            #Deploy Puppet code so tall the environments are ready before node groups are made
+            #Can't use the `puppet code deploy` command because that's not available yet. Not sure why
+            curl -k -X POST -H 'Content-Type: application/json' -H "X-Authentication: `cat ~/.puppetlabs/token`" -d '{"deploy-all": true, "wait": true}' https://master.inf.puppet.vm:8170/code-manager/v1/deploys
+
+            #Update the class list before node groups are made
+            curl -X POST -H 'Content-Type: application/json' \
+              --cert `puppet config print hostcert` \
+              --key `puppet config print hostprivkey` \
+              --cacert `puppet config print cacert` \
+              https://master.inf.puppet.vm:4433/classifier-api/v1/update-classes
+
+            #Create a node group for the master to apply demo configurations such as environments and node groups
+            curl -H 'Content-Type: application/json' -X POST -d '{"name": "PE Master Demo Role", "environment": "production", "parent": "00000000-0000-4000-8000-000000000000", "rule": ["=", ["trusted", "certname"], "master.inf.puppet.vm"], "classes": {"$pe_master_role": {}}}' \
+              --cert `puppet config print hostcert` \
+              --key `puppet config print hostprivkey` \
+              --cacert `puppet config print cacert` \
+              https://master.inf.puppet.vm:4433/classifier-api/v1/groups
+
+            # Using -t will make this script fail because the agent will not exit 0
+            /opt/puppetlabs/bin/puppet agent --onetime --verbose --no-daemonize --no-usecacheonfailure --no-splay --show_diff --no-use_cached_catalog
+
+            if [ $? == 0 ]; then
+              echo "Notifying the rest of the stack that master setup is complete"
+              $wc_notify --data-binary '{"status": "SUCCESS"}'
+            else
+              echo "Notifing the rest of the stack that master setup failed"
+              $wc_notify --data-binary '{"status": "FAILED"}'
+            fi
+          params:
+            $gitlab_floating_ip: { get_attr: [gitlab_floating_ip_association, floating_ip_address] }
+            $pe_source_url: { get_param: pe_source_url }
+            $wc_notify: { get_attr: ['master_server_wait_handle', 'curl_cli'] }
+            $control_repository: "https://github.com/puppetlabs/pmm-puppet-site"
+            $control_private_key: "/dev/null"
+            $pe_master_role: "role::demo::devops::classifier"
+
+  master_server_wait:
+    type: "OS::Heat::WaitCondition"
+    depends_on: master_server
+    properties:
+      handle:
+        get_resource: master_server_wait_handle
+      timeout: 2400
+      count: 1
+
+  master_server_wait_handle:
+    type: "OS::Heat::WaitConditionHandle"
+
+  master_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_param: private_net }
+      security_groups: [sg0]
+
+  master_floating_ip_association:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: { get_resource: master_port }
+
+  gitlab_server:
+    type: OS::Nova::Server
+    depends_on: master_server_wait
+    properties:
+      name: "gitlab.inf.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "m1.medium"
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: gitlab_port }
+      user_data_format: RAW
+      user_data: 
+        str_replace:
+          template: &linux_agent_user_data |
+            #!/bin/bash
+            echo $master_ip master.inf.puppet.vm >> /etc/hosts
+            hostname $(curl http://169.254.169.254/latest/meta-data/local-hostname)
+            echo $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4) $(hostname) >> /etc/hosts
+
+            curl -k https://master.inf.puppet.vm:8140/packages/current/install.bash | bash -s extension_requests:pp_role=$role extension_requests:pp_environment=$environment
+            /opt/puppetlabs/bin/puppet agent -t
+          params:
+            $master_ip: { get_attr: [master_server, first_address] }
+            $role: "gitlab"
+            $environment: "production"
+
+  gitlab_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_param: private_net }
+      security_groups: [sg0]
+
+  gitlab_floating_ip_association:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: { get_resource: gitlab_port }
+
+  jenkins_server:
+    type: OS::Nova::Server
+    depends_on: master_server_wait
+    properties:
+      name: "jenkins.inf.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "m1.medium"
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: jenkins_port }
+      user_data:
+        str_replace:
+          template: *linux_agent_user_data
+          params:
+            $master_ip: { get_attr: [master_server, first_address] }
+            $role: "jenkins"
+            $environment: "production"
+
+  jenkins_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_param: private_net }
+      security_groups: [sg0]
+
+  jenkins_floating_ip_association:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: { get_resource: jenkins_port }
+
+  rgbankdev_server:
+    type: OS::Nova::Server
+    depends_on: master_server_wait
+    properties:
+      name: "rgbank-dev.pdx.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "g1.small"
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: rgbankdev_port }
+      user_data:
+        str_replace:
+          template: *linux_agent_user_data
+          params:
+            $master_ip: { get_attr: [master_server, first_address] }
+            $role: "rgbank-web"
+            $environment: "development"
+
+  rgbankdev_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_param: private_net }
+      security_groups: [sg0]
+
+  rgbankdev_floating_ip_association:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: { get_resource: rgbankdev_port }
+
+  rgbankappserver01_server:
+    type: OS::Nova::Server
+    depends_on: master_server_wait
+    properties:
+      name: "rgbank-appserver-01.pdx.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "g1.small"
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: rgbankappserver01_port }
+      user_data:
+        str_replace:
+          template: *linux_agent_user_data
+          params:
+            $master_ip: { get_attr: [master_server, first_address] }
+            $role: "rgbank-web"
+            $environment: "production"
+
+  rgbankappserver01_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_param: private_net }
+      security_groups: [sg0]
+
+  rgbankappserver01_floating_ip_association:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: { get_resource: rgbankappserver01_port }
+
+  rgbankappserverstaging01_server:
+    type: OS::Nova::Server
+    depends_on: master_server_wait
+    properties:
+      name: "rgbank-appserver-staging-01.pdx.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "g1.small"
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: rgbankappserverstaging01_port }
+      user_data:
+        str_replace:
+          template: *linux_agent_user_data
+          params:
+            $master_ip: { get_attr: [master_server, first_address] }
+            $role: "rgbank-web"
+            $environment: "staging"
+
+  rgbankappserverstaging01_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_param: private_net }
+      security_groups: [sg0]
+
+  rgbankappserverstaging01_floating_ip_association:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: { get_resource:  rgbankappserverstaging01_port }
+
+  databasestaging_server:
+    type: OS::Nova::Server
+    depends_on: master_server_wait
+    properties:
+      name: "database-staging.pdx.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "g1.small"
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: databasestaging_port }
+      user_data:
+        str_replace:
+          template: *linux_agent_user_data
+          params:
+            $master_ip: { get_attr: [master_server, first_address] }
+            $role: "database"
+            $environment: "staging"
+
+  databasestaging_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_param: private_net }
+      security_groups: [sg0]
+
+  databasestaging_floating_ip_association:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: { get_resource:  databasestaging_port }
+
+  databaseproduction_server:
+    type: OS::Nova::Server
+    depends_on: master_server_wait
+    properties:
+      name: "database-production.pdx.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "g1.small"
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: databaseproduction_port }
+      user_data:
+        str_replace:
+          template: *linux_agent_user_data
+          params:
+            $master_ip: { get_attr: [master_server, first_address] }
+            $role: "database"
+            $environment: "production"
+
+  databaseproduction_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_param: private_net } 
+      security_groups: [sg0]
+
+  databaseproduction_floating_ip_association:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: { get_resource:  databaseproduction_port }
+
+  rgbankstagingloadbalancer_server:
+    type: OS::Nova::Server
+    depends_on: master_server_wait
+    properties:
+      name: "rgbank-staging.pdx.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "g1.small"
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: rgbankstagingloadbalancer_port }
+      user_data:
+        str_replace:
+          template: *linux_agent_user_data
+          params:
+            $master_ip: { get_attr: [master_server, first_address] }
+            $role: "loadbalancer"
+            $environment: "staging"
+
+  rgbankstagingloadbalancer_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_param: private_net }
+      security_groups: [sg0]
+
+  rgbankstagingloadbalancer_floating_ip_association:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: { get_resource:  rgbankstagingloadbalancer_port }
+
+  rgbankloadbalancer_server:
+    type: OS::Nova::Server
+    depends_on: master_server_wait
+    properties:
+      name: "rgbank.pdx.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "g1.small"
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: rgbankloadbalancer_port }
+      user_data:
+        str_replace:
+          template: *linux_agent_user_data
+          params:
+            $master_ip: { get_attr: [master_server, first_address] }
+            $role: "loadbalancer"
+            $environment: "production"
+
+  rgbankloadbalancer_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_param: private_net }
+      security_groups: [sg0]
+
+  rgbankloadbalancer_floating_ip_association:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: { get_resource:  rgbankloadbalancer_port }
+
+outputs:
+  master_ip:
+    description: The IP address of the Puppet master server
+    value: { get_attr: [master_floating_ip_association, floating_ip_address] }
+  gitlab_ip:
+    description: The IP address of the Gitlab server
+    value: { get_attr: [gitlab_floating_ip_association, floating_ip_address] }
+  rgbankdev_ip:
+    description: The IP address of the RG Bank dev application
+    value: { get_attr: [rgbankdev_floating_ip_association, floating_ip_address] }
+  rgbankstagingloadbalancer_ip:
+    description: The IP address of the RG Bank staging application
+    value: { get_attr: [rgbankstagingloadbalancer_floating_ip_association, floating_ip_address] }
+  rgbankproductionloadbalancer_ip:
+    description: The IP address of the RG Bank production application
+    value: { get_attr: [rgbankloadbalancer_floating_ip_association, floating_ip_address] }
+  jenkins_ip:
+    description: The IP address of the Jenkins server
+    value: { get_attr: [jenkins_floating_ip_association, floating_ip_address] }

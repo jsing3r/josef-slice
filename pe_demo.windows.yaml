@@ -1,0 +1,99 @@
+heat_template_version: 2015-04-30
+
+description: "TSE PE Demo Stack - windows machines"
+
+parameters:
+  key_name:
+    type: string
+    description: Name of keypair to assign to servers
+    constraints:
+      - { custom_constraint: nova.keypair }
+  pe_demo_build_url:
+    type: string
+    description: URL to download pe-demo build tarball from
+    default: http://tse-builds.s3-us-west-2.amazonaws.com/2017.2.x/releases/pe-demo-latest.tar.gz
+  pe_source_url:
+    type: string
+    description: URL to download Puppet Enterprise from (tar.gz or tar)
+    default: http://pe-releases.puppetlabs.net/2017.2.1/puppet-enterprise-2017.2.1-el-7-x86_64.tar.gz
+
+resources:
+
+  server2012r2a_server:
+    type: OS::Nova::Server
+    properties:
+      name: "server2012r2a.pdx.puppet.vm"
+      image: "windows_2012_r2_std_eval_x86_64"
+      flavor: "g1.large"
+      key_name: { get_param: key_name }
+      security_groups:
+        - "sg0"
+      user_data: &windows_agent_user_data
+        str_replace:
+          template: |
+            #ps1_sysnative
+
+            $puppet_server = "master.inf.puppet.vm"
+            $agent_certname = Invoke-RestMethod -Uri http://169.254.169.254/latest/meta-data/local-hostname
+
+            #Adding a host entry for the PE server
+            $host_entry = "$master_ip $puppet_server"
+            $host_entry | Out-File -FilePath C:\Windows\System32\Drivers\etc\hosts -Append -Encoding ascii
+
+            $master_uri = "http://${puppet_server}:81/deployed.txt"
+
+            #Wait for the master to be available before installing the agent
+            :loop while ($true) {
+              $request = [System.Net.WebRequest]::Create($master_uri)
+              $response = $request.GetResponse()
+              switch ($response.StatusCode.value__)
+              {
+                200
+                {
+                  #PUT A SPACE BETWEEN '{' and '$', OR THEY WILL TURN INTO '%'
+                  [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+                  $webClient = New-Object System.Net.WebClient
+                  $webClient.DownloadFile("https://${puppet_server}:8140/packages/current/install.ps1", 'install.ps1')
+                  .\install.ps1 "main:certname=${agent_certname}"
+                  Write-Host "Installation has completed."
+                  break loop
+                }
+                default { Write-Host "Waiting for the installer to be available"; sleep 30 }
+              }
+            }
+          params:
+            $master_ip: { get_attr: [master_server, first_address] }
+
+  server2012r2a_floating_ip:
+    type: OS::Nova::FloatingIP
+    properties:
+      pool: "ext-net-pdx1-opdx1"
+
+  server2012r2a_floating_ip_association:
+    type: OS::Nova::FloatingIPAssociation
+    properties:
+      floating_ip: { get_resource: server2012r2a_floating_ip }
+      server_id: { get_resource: server2012r2a_server }
+
+  server2012r2b_server:
+    type: OS::Nova::Server
+    properties:
+      name: "server2012r2b.syd.puppet.vm"
+      image: "windows_2012_r2_std_eval_x86_64"
+      flavor: "g1.large"
+      key_name: { get_param: key_name }
+      security_groups:
+        - "sg0"
+      user_data:
+        <<: *windows_agent_user_data
+
+  server2012r2b_floating_ip:
+    type: OS::Nova::FloatingIP
+    properties:
+      pool: "ext-net-pdx1-opdx1"
+
+  server2012r2b_floating_ip_association:
+    type: OS::Nova::FloatingIPAssociation
+    properties:
+      floating_ip: { get_resource: server2012r2b_floating_ip }
+      server_id: { get_resource: server2012r2b_server }

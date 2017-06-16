@@ -1,0 +1,240 @@
+heat_template_version: 2015-04-30
+
+description: "TSE PE Demo Stack 2016.5 for HA specifically"
+
+parameters:
+  key_name:
+    type: string
+    description: Name of keypair to assign to servers
+    constraints:
+      - { custom_constraint: nova.keypair }
+  pe_source_url:
+    type: string
+    description: URL to download Puppet Enterprise from (tar.gz or tar)
+    default: https://s3.amazonaws.com/pe-builds/released/2016.5.1/puppet-enterprise-2016.5.1-el-7-x86_64.tar.gz
+
+resources:
+  master_server:
+    type: OS::Nova::Server
+    properties:
+      name: "HA-master.inf.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "m1.medium"
+      key_name: { get_param: key_name }
+      security_groups:
+        - "sg0"
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+            set -ex
+            export PATH=/opt/puppetlabs/bin:$PATH
+            export HOME=/root
+            nc_url='https://HA-master.inf.puppet.vm:4433/classifier-api/v1'
+            hostname $(curl http://169.254.169.254/latest/meta-data/local-hostname)
+            echo $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4) $(hostname) >> /etc/hosts
+            echo $master_replica_floating_ip HA-master-replica.inf.puppet.vm >> /etc/hosts
+            mkdir -p /etc/puppetlabs/puppet
+            echo '*' > /etc/puppetlabs/puppet/autosign.conf
+            retrycurl() { set +e; while :; do curl "$@"; [ "$?" = 0 ] && break; done; set -e; }
+            retrycurl --max-time 30 -o pe.archive $pe_source_url
+            tar -xf pe.archive
+            cat > pe.conf <<-EOF
+            {
+              "console_admin_password": "puppetlabs"
+              "puppet_enterprise::puppet_master_host": "%{::trusted.certname}"
+              "puppet_enterprise::profile::master::r10k_remote": "https://github.com/murdok5/control-repo-HA.git"
+              "puppet_enterprise::profile::master::code_manager_auto_configure": true
+              "puppet_enterprise::profile::master::check_for_updates": false
+            }
+            EOF
+            ./puppet-enterprise-*-el-7-x86_64/puppet-enterprise-installer -c pe.conf
+
+            #Create non-admin user (tse)
+            #Needed because admin user cannot issue code deployments through code manager
+            curl -H "Content-Type: application/json" -X POST -d '{"login":"tse", "email":"tse@puppet.com", "display_name":"TSE Demo", "role_ids":[1], "password":"puppetlabs" }' \
+              --cert `puppet config print hostcert` \
+              --key `puppet config print hostprivkey` \
+              --cacert `puppet config print cacert` \
+              https://HA-master.inf.puppet.vm:4433/rbac-api/v1/users
+            #Get access token needed for code deploy (Code manager API does not support white listed certificates for auth)
+            mkdir -p /root/.puppetlabs
+            curl --cacert `puppet config print cacert` -X POST -H 'Content-Type: application/json' \
+              -d '{"login": "tse", "password": "puppetlabs", "lifetime": "1y", "label": "one-year token"}' \
+              https://HA-master.inf.puppet.vm:4433/rbac-api/v1/auth/token | python -c 'import sys, json; print json.load(sys.stdin)["token"]'>/root/.puppetlabs/token
+
+            /opt/puppetlabs/puppet/bin/gem install --no-ri --no-rdoc puppetclassify
+
+            token=$(cat /root/.puppetlabs/token)
+            echo $(token)
+            curl -k -X POST -H 'Content-Type: application/json' -H "X-Authentication: $token" -d '{"deploy-all": true, "wait": true}' https://ha-master.inf.puppet.vm:8170/code-manager/v1/deploys
+            puppet code deploy production
+
+            /opt/puppetlabs/bin/puppet agent --onetime --verbose --no-daemonize --no-usecacheonfailure --no-splay --show_diff --no-use_cached_catalog
+            /opt/puppetlabs/bin/puppet agent --onetime --verbose --no-daemonize --no-usecacheonfailure --no-splay --show_diff --no-use_cached_catalog
+            /opt/puppetlabs/bin/puppet agent --onetime --verbose --no-daemonize --no-usecacheonfailure --no-splay --show_diff --no-use_cached_catalog
+
+            #need to pause here while ha-master-replica gets puppet agent in order to proceed
+            sleep 10m
+
+            #echo "READY TO PROVISION REPLICA------"
+            /opt/puppetlabs/server/apps/enterprise/bin/puppet-infrastructure provision replica ha-master-replica.inf.puppet.vm
+
+            #need to wait for replica services to sync
+            sleep 1m
+
+            /opt/puppetlabs/server/apps/enterprise/bin/puppet-infrastructure enable replica ha-master-replica.inf.puppet.vm --topology mono --yes
+            puppet job run --no-enforce-environment --query 'nodes {deactivated is null}'
+
+          params:
+            $pe_source_url: { get_param: pe_source_url }
+            $master_replica_floating_ip: { get_attr: [master_replica_floating_ip, ip] }
+
+  master_floating_ip:
+    type: OS::Nova::FloatingIP
+    properties:
+      pool: "ext-net-pdx1-opdx1"
+
+  master_floating_ip_association:
+    type: OS::Nova::FloatingIPAssociation
+    properties:
+      floating_ip: { get_resource: master_floating_ip }
+      server_id: { get_resource: master_server }
+
+  master_replica_server:
+    type: OS::Nova::Server
+    properties:
+      name: "HA-master-replica.inf.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "m1.medium"
+      key_name: { get_param: key_name }
+      security_groups:
+        - "sg0"
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+            echo $master_ip HA-master.inf.puppet.vm >> /etc/hosts
+            hostname $(curl http://169.254.169.254/latest/meta-data/local-hostname)
+            echo $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4) $(hostname) >> /etc/hosts
+            sleep 10m
+            curl -k https://ha-master.inf.puppet.vm:8140/packages/current/install.bash | bash
+            sleep 2m
+            puppet agent -t
+          params:
+            $master_ip: { get_attr: [master_server, first_address] }
+
+  master_replica_floating_ip:
+    type: OS::Nova::FloatingIP
+    properties:
+      pool: "ext-net-pdx1-opdx1"
+
+  master_replica_floating_ip_association:
+    type: OS::Nova::FloatingIPAssociation
+    properties:
+      floating_ip: { get_resource: master_replica_floating_ip }
+      server_id: { get_resource: master_replica_server }
+
+  centos7b_server:
+    type: OS::Nova::Server
+    properties:
+      name: "HA-centos7b.syd.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "g1.medium"
+      key_name: { get_param: key_name }
+      security_groups:
+        - "sg0"
+      user_data: &linux_agent_user_data
+        str_replace:
+          template: |
+            #!/bin/bash
+            echo $master_ip HA-master.inf.puppet.vm >> /etc/hosts
+            echo $master_replica_ip HA-master-replica.inf.puppet.vm >> /etc/hosts
+            hostname $(curl http://169.254.169.254/latest/meta-data/local-hostname)
+            echo $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4) $(hostname) >> /etc/hosts
+            sleep 10m
+            curl -k https://ha-master.inf.puppet.vm:8140/packages/current/install.bash | bash
+            sleep 2m
+            puppet agent -t
+          params:
+            $master_ip: { get_attr: [master_server, first_address] }
+            $master_replica_ip: { get_attr: [master_replica_server, first_address] }
+
+  centos7b_floating_ip:
+    type: OS::Nova::FloatingIP
+    properties:
+      pool: "ext-net-pdx1-opdx1"
+
+  centos7b_floating_ip_association:
+    type: OS::Nova::FloatingIPAssociation
+    properties:
+      floating_ip: { get_resource: centos7b_floating_ip }
+      server_id: { get_resource: centos7b_server }
+
+  centos7c_server:
+    type: OS::Nova::Server
+    properties:
+      name: "HA-centos7c.pdx.puppet.vm"
+      image: "centos_7_x86_64"
+      flavor: "g1.medium"
+      key_name: { get_param: key_name }
+      security_groups:
+        - "sg0"
+      user_data:
+        <<: *linux_agent_user_data
+
+  centos7c_floating_ip:
+    type: OS::Nova::FloatingIP
+    properties:
+      pool: "ext-net-pdx1-opdx1"
+
+  centos7c_floating_ip_association:
+    type: OS::Nova::FloatingIPAssociation
+    properties:
+      floating_ip: { get_resource: centos7c_floating_ip }
+      server_id: { get_resource: centos7c_server }
+  server2012r2a_server:
+    type: OS::Nova::Server
+    properties:
+      name: "HA-server2012r2a.pdx.puppet.vm"
+      image: "windows_2012_r2_std_eval_x86_64"
+      flavor: "g1.large"
+      key_name: { get_param: key_name }
+      security_groups:
+        - "sg0"
+      user_data: &windows_agent_user_data
+        str_replace:
+          template: |
+            #ps1
+            $server          = "HA-master.inf.puppet.vm"
+            $server2          = "HA-master-replica.inf.puppet.vm"
+            $agent_certname = Invoke-RestMethod -Uri http://169.254.169.254/latest/meta-data/local-hostname
+            function MakeMasterHostsEntry {
+              $host_entry = "$master_ip $server"
+              $host_entry | Out-File -FilePath C:\Windows\System32\Drivers\etc\hosts -Append -Encoding ascii
+              $host_entry = "$master_replica_ip $server2"
+              $host_entry | Out-File -FilePath C:\Windows\System32\Drivers\etc\hosts -Append -Encoding ascii
+            }
+            MakeMasterHostsEntry
+            Start-Sleep -s 600
+            [Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}; $webClient = New-Object System.Net.WebClient; $webClient.DownloadFile("https://$($server):8140/packages/current/install.ps1", 'install.ps1'); .\install.ps1 agent:certname=$agent_certname
+          params:
+            $master_ip: { get_attr: [master_server, first_address] }
+            $master_replica_ip: { get_attr: [master_replica_server, first_address] }
+
+  server2012r2a_floating_ip:
+    type: OS::Nova::FloatingIP
+    properties:
+      pool: "ext-net-pdx1-opdx1"
+
+  server2012r2a_floating_ip_association:
+    type: OS::Nova::FloatingIPAssociation
+    properties:
+      floating_ip: { get_resource: server2012r2a_floating_ip }
+      server_id: { get_resource: server2012r2a_server }
+
+outputs:
+  master_ip:
+    description: The IP address of the Puppet master server
+    value: { get_attr: [master_floating_ip, ip] }
